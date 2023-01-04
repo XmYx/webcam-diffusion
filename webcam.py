@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image, ImageFilter, ImageDraw
 from PySide6.QtCore import Signal, QObject, QThreadPool, Slot, QRunnable
 from PySide6.QtWidgets import QTextEdit, QSpinBox, QDoubleSpinBox, QLineEdit, QComboBox, QLabel
+from matplotlib import pyplot as plt
 from omegaconf import OmegaConf
 from einops import repeat, rearrange
 from pytorch_lightning import seed_everything
@@ -31,17 +32,30 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.data.util import AddMiDaS
 from PIL.ImageQt import ImageQt
+import requests
+import cv2
+sys.path.append("clipseg")
+from models.clipseg import CLIPDensePredT
+from PIL import Image
+from torchvision import transforms
+from io import BytesIO
 
+from torch import autocast
+import requests
+import PIL
+import torch
+from diffusers import StableDiffusionInpaintPipeline as StableDiffusionInpaintPipeline
 from resizeRight import resizeright, interp_methods
-
+import torchvision.transforms as T
 torch.set_grad_enabled(False)
 import threading
 
 import cv2
 import numpy as np
 
-def blend_images(img1, img2, num_frames=75):
+def blend_images(img1, img2, num_frames=10):
     images = []
+    print(img1, img2)
     if img1.size[0] != img2.size[0]:
         img1 = img1.resize(img2.size, resample=Image.Resampling.NEAREST)
     for i in range(num_frames):
@@ -230,9 +244,9 @@ class WebcamWidget(QtWidgets.QWidget):
         self.signals.updateimagesignal.connect(self.update_image)
         self.signals.webcamupdate.connect(self.update_frame_func)
         # Set up the user interface
-        self.capture_button = QtWidgets.QPushButton('Capture')
+        self.capture_button = QtWidgets.QPushButton('Stop')
         self.capture_button.clicked.connect(self.capture_image)
-        self.continous = QtWidgets.QPushButton('Continous')
+        self.continous = QtWidgets.QPushButton('Start')
         self.continous.clicked.connect(self.start_continuous_capture)
         self.webcam_dropdown = QtWidgets.QComboBox()
         self.webcam_dropdown.addItems(self.get_available_webcams())
@@ -240,6 +254,7 @@ class WebcamWidget(QtWidgets.QWidget):
         self.camera_label = QtWidgets.QLabel()
         self.camera_label.setFixedSize(512, 512)
 
+        self.maskprompt = QTextEdit()
         self.prompt = QTextEdit()
         self.steps = QSpinBox()
         self.steps.setValue(20)
@@ -268,9 +283,10 @@ class WebcamWidget(QtWidgets.QWidget):
         self.samplercombobox.addItems(["klms", "dpm2", "dpm2_ancestral", "heun", "euler", "euler_ancestral",
                                         "dpm_fast", "dpm_adaptive", "dpmpp_2s_a", "dpmpp_2m", "dpmpp_sde"])
         self.modelselect = QComboBox()
-        self.modelselect.addItems(["Normal", "Depth Model"])
+        self.modelselect.addItems(["Normal", "Depth Model", "Inpaint"])
         # Set up the layout
         layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(self.maskprompt)
         layout.addWidget(self.prompt)
         layout.addWidget(self.steps)
         layout.addWidget(self.strength)
@@ -327,10 +343,10 @@ class WebcamWidget(QtWidgets.QWidget):
     def start_webcam(self):
         """Start the webcam and display the video feed."""
         self.capture = cv2.VideoCapture(self.webcam_dropdown.currentIndex())
-        #if self.capture.isOpened():
-        #    self.wtimer = QtCore.QTimer()
-        #    self.wtimer.timeout.connect(self.update_frame)
-        #    self.wtimer.start(8)
+        if self.capture.isOpened():
+            self.wtimer = QtCore.QTimer()
+            self.wtimer.timeout.connect(self.update_frame)
+            self.wtimer.start(8)
 
     def update_frame(self):
         """Update the camera preview label with the latest frame."""
@@ -345,40 +361,47 @@ class WebcamWidget(QtWidgets.QWidget):
     def capture_image(self):
         """Capture an image from the webcam and display it in a new floating window."""
         self.run = False
-        _, frame = self.capture.read()
-        image = Image.fromarray(frame)
+        #_, frame = self.capture.read()
+        #image = Image.fromarray(frame)
 
         # Call the paint function and get the resulting image
-        result_image = self.img2img(image, "Monster in the shadow", 5, 1, 7.5, random.randint(0, 400000), 0.0, 0.6)
+        #result_image = self.img2img(image, "Monster in the shadow", 5, 1, 7.5, random.randint(0, 400000), 0.0, 0.6)
 
         # Create a QLabel to display the image
-        self.image_label.setPixmap(QtGui.QPixmap.fromImage(ImageQt(result_image)))
-        self.image_label.setScaledContents(True)
+        #self.image_label.setPixmap(QtGui.QPixmap.fromImage(ImageQt(result_image)))
+        #self.image_label.setScaledContents(True)
 
     def start_continuous_capture(self):
 
         inference = self.modelselect.currentText()
         if inference == "Normal":
-            if self.loadedmodel == None or self.loadedmodel == "depth":
+            if self.loadedmodel != "normal":
                 self.model = load_model_from_config("configs/stable-diffusion/v1-inference.yaml",
-                                                    "models/v1-5-pruned-emaonly.ckpt")
+                                                    "models/redshiftDiffusion_v1.ckpt")
                 self.loadedmodel = "normal"
                 self.midas_trafo = None
                 self.sampler = None
         elif inference == "Depth Model":
-            if self.loadedmodel == None or self.loadedmodel == "normal":
+            if self.loadedmodel != "depth":
                 self.model = initialize_model("configs/stable-diffusion/v2-midas-inference.yaml",
                                            "models/512-depth-ema.ckpt")
                 self.sampler = DDIMSampler(self.model)
                 model_type = "dpt_hybrid"
                 self.midas_trafo = AddMiDaS(model_type=model_type)
                 self.loadedmodel = "depth"
+        elif inference == "Inpaint":
+            if self.loadedmodel != "inpaint":
+
+                self.init_inpaintmasking()
+                self.loadedmodel = "inpaint"
 
         """Start the continuous capture in a separate thread."""
         self.run = True
-
+        torch.cuda.empty_cache()
         worker = Worker(self.continuous_capture)
         self.threadpool.start(worker)
+        worker2 = Worker(self.continous_mask_thread)
+        self.threadpool.start(worker2)
         # Create a QTimer
         self.timer2 = QtCore.QTimer()
 
@@ -408,13 +431,20 @@ class WebcamWidget(QtWidgets.QWidget):
         #self.capture_thread = threading.Thread(target=self.continuous_capture)
         #self.capture_thread.start()
     def start_continous_capture_again(self):
-        worker2 = Worker(self.continuous_capture)
+        worker2 = Worker(self.continous_mask_thread)
         self.threadpool.start(worker2)
 
     def make_sampler_schedule(self):
         steps = self.steps.value()
         eta = self.eta.value()
-        self.sampler.make_schedule(steps, ddim_eta=eta, verbose=True)
+        if self.loadedmodel == 'normal':
+            self.sampler.make_schedule(steps, ddim_eta=eta, verbose=True)
+    def continous_mask_thread(self, progress_callback=None):
+        while self.run == True:
+            _, frame = self.capture.read()
+            self.frame_to_mask_png(frame)
+        if self.run == False:
+            return
 
     def continuous_capture(self, progress_callback=None):
         """Capture images from the webcam continuously."""
@@ -428,94 +458,106 @@ class WebcamWidget(QtWidgets.QWidget):
         #self.iterator_thread = threading.Thread(target=self.iterator)
         #elf.iterator_thread.start()
         self.seedint = 0
+        if self.loadedmodel == "inpaint":
+            self.model = None
+        if self.loadedmodel == "normal":
+            with autocast("cuda"):
+                self.uc = self.model.get_learned_conditioning(1 * [""])
 
-        model_wrap = CompVisDenoiser(self.model, quantize=False)
+            self.init_mask_model()
+            model_wrap = CompVisDenoiser(self.model, quantize=False)
 
-        loss_fns_scales = [
-            [None, 0.0],
-            [None, 0.0],
-            [None, 0.0],
-            [None, 0.0],
-            [None, 0.0],
-            [None, 0.0],
-            [None, 0.0],
-            [None, 0.0]
-        ]
-        clamp_fn = threshold_by(threshold=0, threshold_type='dynamic',
-                                clamp_schedule=[0])
-        grad_inject_timing_fn = make_inject_timing_fn(None, model_wrap, 10)
-        self.cfg_model = CFGDenoiserWithGrad(model_wrap,
-                                        loss_fns_scales,
-                                        clamp_fn,
-                                        None,
-                                        None,
-                                        True,
-                                        decode_method=None,
-                                        grad_inject_timing_fn=grad_inject_timing_fn,
-                                        grad_consolidate_fn=None,
-                                        verbose=False)
-
-
+            loss_fns_scales = [
+                [None, 0.0],
+                [None, 0.0],
+                [None, 0.0],
+                [None, 0.0],
+                [None, 0.0],
+                [None, 0.0],
+                [None, 0.0],
+                [None, 0.0]
+            ]
+            clamp_fn = threshold_by(threshold=0, threshold_type='dynamic',
+                                    clamp_schedule=[0])
+            grad_inject_timing_fn = make_inject_timing_fn(1, model_wrap, 10)
+            self.cfg_model = CFGDenoiserWithGrad(model_wrap,
+                                            loss_fns_scales,
+                                            clamp_fn,
+                                            None,
+                                            "both",
+                                            True,
+                                            decode_method=None,
+                                            grad_inject_timing_fn=grad_inject_timing_fn,
+                                            grad_consolidate_fn=None,
+                                            verbose=False)
+        _, frame = self.capture.read()
+        self.frame_to_mask_png(frame)
         while self.run == True:
-            _, frame = self.capture.read()
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            #image = Image.fromarray(frame)
+            with autocast("cuda"):
+            #with torch.inference_mode():
+                _, frame = self.capture.read()
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                #image = Image.fromarray(frame)
 
-            # Call the predict function and get the resulting image
-            prompt = self.prompt.toPlainText()
-            steps = self.steps.value()
-            strength = self.strength.value()
-            self.seedint = self.seed.text() if self.seed.text() != '' else self.seedint
-            self.seedint = int(self.seedint) + 1 if self.seedint != '' else random.randint(0, 4000000)
-            eta = self.eta.value()
-            if self.loadedmodel == 'depth':
-                self.sampler.make_schedule(steps, ddim_eta=eta, verbose=True)
+                # Call the predict function and get the resulting image
+                prompt = self.prompt.toPlainText()
+                steps = self.steps.value()
+                strength = self.strength.value()
+                self.seedint = self.seed.text() if self.seed.text() != '' else self.seedint
+                self.seedint = int(self.seedint) + 1 if self.seedint != '' else random.randint(0, 4000000)
+                eta = self.eta.value()
+                if self.loadedmodel == 'depth':
+                    self.sampler.make_schedule(steps, ddim_eta=eta, verbose=True)
 
-            #factor = 1.10
-            #image = image.resize((int(image.size[0] / factor), int(image.size[1] / factor)),
-            #                                 resample=Image.Resampling.NEAREST)
+                #factor = 1.10
+                #image = image.resize((int(image.size[0] / factor), int(image.size[1] / factor)),
+                #                                 resample=Image.Resampling.NEAREST)
 
-            #result_image = self.img2img(small_image, prompt,
-            #                            3, 1, 7.5, self.seedint, eta, 0.40)
-            if self.loadedmodel == 'normal':
-                result_image = self.img2img(frame, prompt,
-                                            steps, 1, 12.5, self.seedint, eta, strength)
-            else:
-                result_image = self.predict(frame, prompt,
-                                            steps, 1, 12.5, self.seedint, eta, strength)
+                #result_image = self.img2img(small_image, prompt,
+                #                            3, 1, 7.5, self.seedint, eta, 0.40)
+                if self.loadedmodel == 'normal':
+                    result_image = self.img2img(frame, prompt,
+                                                steps, 1, 12.5, self.seedint, eta, strength)
+                elif self.loadedmodel == 'depth':
+                    result_image = self.predict(frame, prompt,
+                                                steps, 1, 12.5, self.seedint, eta, strength)
+                elif self.loadedmodel == 'inpaint':
+                    mask_prompt = self.maskprompt.toPlainText()
+                    result_image = self.inpaint_mask_and_replace(frame, mask_prompt, prompt,
+                                                steps, 1, 12.5, self.seedint, eta, strength)
 
-            # Store the result image in a list
-            #result_images.append(result_image[1])
-            self.images.append(result_image)
-            self.morphed_images = []
-            if len(self.images) > 1:
-                self.index = 0
-                self.morphed_images = blend_images(self.images[len(self.images) - 2], self.images[len(self.images) - 1])
-            # If there are two result images, interpolate between them using Image.blend
-            """if len(result_images) == 2:
-                # Interpolate between the result images using Image.blend
-                #images = []
-                for i in range(1, 51):
-                    current_image = result_images[0]
-                    next_image = result_images[1]
-                    interpolated_image = Image.blend(current_image, next_image, i / 50)
-                    #images.append(interpolated_image)
-                    self.images.append(interpolated_image)
-                #self.timer = QtCore.QTimer()
-
-                # Set the timer interval
-                #self.timer.setInterval(8)
-
-                # Connect the timer's timeout signal to the update_image slot
-                #self.timer.timeout.connect(self.update_image_signal)
-                # Start the timer
-                #self.timer.start()
-                # Display the last interpolated image on the QLabel
-                    #self.image_label.setPixmap(QtGui.QPixmap.fromImage(ImageQt(interpolated_image)))
-                    #self.image_label.setScaledContents(True)
-
-                # Set the second result image as the first element of the list
-                result_images = [result_images[1]]"""
+                # Store the result image in a list
+                #result_images.append(result_image[1])
+                self.images.append(result_image)
+                self.morphed_images = []
+                if len(self.images) > 1:
+                    self.index = 0
+                    self.morphed_images = blend_images(self.images[len(self.images) - 2], self.images[len(self.images) - 1])
+                # If there are two result images, interpolate between them using Image.blend
+                """if len(result_images) == 2:
+                    # Interpolate between the result images using Image.blend
+                    #images = []
+                    for i in range(1, 51):
+                        current_image = result_images[0]
+                        next_image = result_images[1]
+                        interpolated_image = Image.blend(current_image, next_image, i / 50)
+                        #images.append(interpolated_image)
+                        self.images.append(interpolated_image)
+                    #self.timer = QtCore.QTimer()
+    
+                    # Set the timer interval
+                    #self.timer.setInterval(8)
+    
+                    # Connect the timer's timeout signal to the update_image slot
+                    #self.timer.timeout.connect(self.update_image_signal)
+                    # Start the timer
+                    #self.timer.start()
+                    # Display the last interpolated image on the QLabel
+                        #self.image_label.setPixmap(QtGui.QPixmap.fromImage(ImageQt(interpolated_image)))
+                        #self.image_label.setScaledContents(True)
+    
+                    # Set the second result image as the first element of the list
+                    result_images = [result_images[1]]"""
             if self.run == False:
                 break
 
@@ -575,7 +617,73 @@ class WebcamWidget(QtWidgets.QWidget):
             self.image_label.setScaledContents(True)
 
         #self.iterator()"""
+    def init_inpaintmasking(self):
+        self.init_mask_model()
+        device = "cuda"
+        self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            "runwayml/stable-diffusion-inpainting",
+            revision="fp16",
+            torch_dtype=torch.float16,
+            use_auth_token=""
+        ).to(device)
+        self.pipe.enable_xformers_memory_efficient_attention()
+        #torch.backends.cudnn.benchmark = True
+        self.pipe.safety_checker = dummy
+        torch.backends.cuda.matmul.allow_tf32 = True
+    def init_mask_model(self):
+        self.maskmodel = CLIPDensePredT(version='ViT-B/16', reduce_dim=64, complex_trans_conv=True)
+        self.maskmodel.eval()
+        self.maskmodel.load_state_dict(torch.load('weights/rd64-uni-refined.pth'), strict=False)
+    def frame_to_mask_png(self, frame):
+        #self.mask = Image.open('mask.png')
+        input_image = Image.fromarray(frame)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Resize((512, 512)),
+        ])
+        img = transform(input_image).unsqueeze(0)
+        #input_image.convert("RGB").resize((512, 512)).save("init_image.png", "PNG")
+        prompts = [self.maskprompt.toPlainText()]
+        # predict
+        with torch.no_grad():
+            preds = self.maskmodel(img.repeat(len(prompts), 1, 1, 1), prompts)[0]
+        # Convert the image data to a NumPy array
+        image_data = preds[0][0].numpy()
+        # Normalize the image data between 0 and 255
+        #image_data = (image_data * 255).astype(np.uint8)
+        transform = transforms.ToPILImage()
+        self.mask = transform(torch.sigmoid(preds[0][0]))
+        # Convert the image data to a PIL.Image object
+        #self.mask = Image.fromarray(preds)
+        self.mask.save("mask.png")
+        #filename = f"mask.png"
+        #plt.imsave(filename, torch.sigmoid(preds[0][0]))
 
+        #self.mask = Image.open('mask.png')
+    def inpaint_mask_and_replace(self, frame, mask_prompt, prompt, steps, n_samples, scale, seed, eta, strength):
+
+        #self.frame_to_mask_png(frame)
+        #img2 = cv2.imread(filename)
+
+        #gray_image = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+
+        #(thresh, bw_image) = cv2.threshold(gray_image, 100, 255, cv2.THRESH_BINARY)
+
+        # For debugging only:
+        #cv2.imwrite(filename, bw_image)
+
+        # fix color format
+        #cv2.cvtColor(bw_image, cv2.COLOR_BGR2RGB)
+
+        #Image.fromarray(bw_image)
+        input_image = Image.fromarray(frame)
+        init_image = input_image.convert("RGB").resize((512, 512))
+        mask = self.mask
+
+        images = self.pipe(prompt=self.prompt.toPlainText(), num_inference_steps=self.steps.value(), image=init_image, mask_image=self.mask, seed=self.seedint)['images']
+
+        return images[0]
     def img2img(self, input_image, prompt, steps, num_samples, scale, seed, eta, strength):
         #factor = 1.25
         #image = input_image.resize((int(input_image.size[0] / factor), int(input_image.size[1] / factor)), resample=Image.Resampling.NEAREST)
@@ -641,10 +749,11 @@ class WebcamWidget(QtWidgets.QWidget):
                             args.steps = steps
                             args.log_weighted_subprompts = False
                             args.normalize_prompt_weights = True
-                            uc, c = get_uc_and_c(prompts, self.model, args, 0)
+                            #uc, c = get_uc_and_c(prompts, self.model, args, 0)
+                            c = self.model.get_learned_conditioning(prompts)
                             samples = sampler_fn(
                                 c=c,
-                                uc=uc,
+                                uc=self.uc,
                                 args=args,
                                 model_wrap=self.cfg_model,
                                 init_latent=init_latent,
@@ -830,6 +939,8 @@ class WebcamWidget(QtWidgets.QWidget):
         batch["midas_in"] = repeat(torch.from_numpy(batch["midas_in"][None, ...]).to(
             device=device), "1 ... -> n ...", n=num_samples)
         return batch
+def dummy(images, **kwargs):
+    return images, False
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)

@@ -137,6 +137,7 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
             if self.cond_uncond_sync:
                 # x0 = self.cfg_cond_model_fn_(x, sigma, uncond=uncond, cond=cond, cond_scale=cond_scale)
                 cond_in = torch.cat([uncond, cond])
+
                 x0 = self.cond_model_fn_(x, sigma, cond=cond_in, inner_model=_cfg_model)
 
             # Calculate cond and uncond separately
