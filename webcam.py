@@ -40,7 +40,7 @@ import threading
 import cv2
 import numpy as np
 
-def blend_images(img1, img2, num_frames=25):
+def blend_images(img1, img2, num_frames=75):
     images = []
     if img1.size[0] != img2.size[0]:
         img1 = img1.resize(img2.size, resample=Image.Resampling.NEAREST)
@@ -239,11 +239,6 @@ class WebcamWidget(QtWidgets.QWidget):
         self.webcam_dropdown.currentIndexChanged.connect(self.start_webcam)
         self.camera_label = QtWidgets.QLabel()
         self.camera_label.setFixedSize(512, 512)
-        #self.model = initialize_model("configs/stable-diffusion/v2-midas-inference.yaml",
-        #                           "models/512-depth-ema.ckpt")
-        self.model = load_model_from_config("configs/stable-diffusion/v1-inference.yaml",
-                                   "models/v1-5-pruned-emaonly.ckpt")
-        #self.sampler = DDIMSampler(self.model)
 
         self.prompt = QTextEdit()
         self.steps = QSpinBox()
@@ -272,6 +267,8 @@ class WebcamWidget(QtWidgets.QWidget):
         self.samplercombobox = QComboBox()
         self.samplercombobox.addItems(["klms", "dpm2", "dpm2_ancestral", "heun", "euler", "euler_ancestral",
                                         "dpm_fast", "dpm_adaptive", "dpmpp_2s_a", "dpmpp_2m", "dpmpp_sde"])
+        self.modelselect = QComboBox()
+        self.modelselect.addItems(["Normal", "Depth Model"])
         # Set up the layout
         layout = QtWidgets.QVBoxLayout()
         layout.addWidget(self.prompt)
@@ -283,6 +280,7 @@ class WebcamWidget(QtWidgets.QWidget):
         layout.addWidget(self.eta)
         layout.addWidget(self.seed)
         layout.addWidget(self.samplercombobox)
+        layout.addWidget(self.modelselect)
         layout.addWidget(self.webcam_dropdown)
         layout.addWidget(self.capture_button)
         layout.addWidget(self.continous)
@@ -308,9 +306,7 @@ class WebcamWidget(QtWidgets.QWidget):
         self.image_dialog.setLayout(prevlayout)
         # Show the dialog
         self.image_dialog.show()
-        model_type = "dpt_hybrid"
-        #self.midas_trafo = AddMiDaS(model_type=model_type)
-
+        self.loadedmodel = None
 
 
     def show_fullscreen(self):
@@ -360,6 +356,24 @@ class WebcamWidget(QtWidgets.QWidget):
         self.image_label.setScaledContents(True)
 
     def start_continuous_capture(self):
+
+        inference = self.modelselect.currentText()
+        if inference == "Normal":
+            if self.loadedmodel == None or self.loadedmodel == "depth":
+                self.model = load_model_from_config("configs/stable-diffusion/v1-inference.yaml",
+                                                    "models/v1-5-pruned-emaonly.ckpt")
+                self.loadedmodel = "normal"
+                self.midas_trafo = None
+                self.sampler = None
+        elif inference == "Depth Model":
+            if self.loadedmodel == None or self.loadedmodel == "normal":
+                self.model = initialize_model("configs/stable-diffusion/v2-midas-inference.yaml",
+                                           "models/512-depth-ema.ckpt")
+                self.sampler = DDIMSampler(self.model)
+                model_type = "dpt_hybrid"
+                self.midas_trafo = AddMiDaS(model_type=model_type)
+                self.loadedmodel = "depth"
+
         """Start the continuous capture in a separate thread."""
         self.run = True
 
@@ -411,7 +425,6 @@ class WebcamWidget(QtWidgets.QWidget):
         self.index = 0
         #self.make_sampler_schedule()
         self.lastinit = None
-        #self.sampler.make_schedule(steps, ddim_eta=eta, verbose=True)
         #self.iterator_thread = threading.Thread(target=self.iterator)
         #elf.iterator_thread.start()
         self.seedint = 0
@@ -455,15 +468,21 @@ class WebcamWidget(QtWidgets.QWidget):
             self.seedint = self.seed.text() if self.seed.text() != '' else self.seedint
             self.seedint = int(self.seedint) + 1 if self.seedint != '' else random.randint(0, 4000000)
             eta = self.eta.value()
+            if self.loadedmodel == 'depth':
+                self.sampler.make_schedule(steps, ddim_eta=eta, verbose=True)
+
             #factor = 1.10
             #image = image.resize((int(image.size[0] / factor), int(image.size[1] / factor)),
             #                                 resample=Image.Resampling.NEAREST)
 
             #result_image = self.img2img(small_image, prompt,
             #                            3, 1, 7.5, self.seedint, eta, 0.40)
-
-            result_image = self.img2img(frame, prompt,
-                                        steps, 1, 12.5, self.seedint, eta, strength)
+            if self.loadedmodel == 'normal':
+                result_image = self.img2img(frame, prompt,
+                                            steps, 1, 12.5, self.seedint, eta, strength)
+            else:
+                result_image = self.predict(frame, prompt,
+                                            steps, 1, 12.5, self.seedint, eta, strength)
 
             # Store the result image in a list
             #result_images.append(result_image[1])
@@ -590,7 +609,7 @@ class WebcamWidget(QtWidgets.QWidget):
                                                  out_shape=[init_latent.shape[0], init_latent.shape[1], int(init_latent.shape[2] // factor),
                                                             int(init_latent.shape[3] // factor)],
                                                  interp_method=interp_methods.lanczos3, support_sz=None,
-                                                 antialiasing=True, by_convs=True, scale_tolerance=None,
+                                                 antialiasing=False, by_convs=True, scale_tolerance=None,
                                                  max_numerator=10, pad_mode='reflect')
 
                     #tic = time.time()
@@ -633,6 +652,13 @@ class WebcamWidget(QtWidgets.QWidget):
                                 device="cuda",
                                 cb=None,
                                 verbose=False)
+                            """samples = resizeright.resize(samples, scale_factors=None,
+                                                             out_shape=[init_latent.shape[0], init_latent.shape[1],
+                                                                        int(init_latent.shape[2] * factor * 2),
+                                                                        int(init_latent.shape[3] * factor * 2)],
+                                                             interp_method=interp_methods.lanczos3, support_sz=None,
+                                                             antialiasing=False, by_convs=True, scale_tolerance=None,
+                                                             max_numerator=10, pad_mode='reflect')"""
 
                             x_samples = self.model.decode_first_stage(samples)
                             x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
@@ -666,6 +692,7 @@ class WebcamWidget(QtWidgets.QWidget):
     def predict(self, input_image, prompt, steps, num_samples, scale, seed, eta, strength):
         do_full_sample = strength == 1.
         t_enc = min(int(strength * steps), steps-1)
+        input_image = Image.fromarray(input_image)
         width, height = input_image.size
         # Calculate the width and height of each quadrant
         quad_width = width // 2
